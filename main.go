@@ -16,46 +16,101 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/russross/blackfriday"
+	"io"
 	"io/ioutil"
+	"log"
 	"os"
+	"path"
 	"runtime/pprof"
-	"strings"
 )
 
-const DEFAULT_TITLE = ""
+const (
+	configFilename = "blackfriday.json"
+)
 
-func main() {
-	// parse command-line options
-	var page, toc, toconly, xhtml, latex, smartypants, latexdashes, fractions bool
-	var css, cpuprofile string
-	var repeat int
-	flag.BoolVar(&page, "page", false,
+var cfg = struct {
+	Page        bool
+	TOC         bool
+	TOCOnly     bool
+	XHTML       bool
+	Latex       bool
+	Smartypants bool
+	LatexDashes bool
+	Fractions   bool
+	Footnotes   bool
+	Title       string
+	CSS         string
+	CPUProfile  string
+	Repeat      int
+}{
+	XHTML:       true,
+	Smartypants: true,
+	LatexDashes: true,
+	Fractions:   true,
+	Repeat:      1,
+}
+
+// Parse config file; error will never be never be NotExist
+func parseConfig() error {
+	paths := [...]string{
+		path.Join(os.ExpandEnv("${XDG_CONFIG_HOME}"), configFilename),
+		path.Join(os.ExpandEnv("${HOME}"), ".config", configFilename),
+		path.Join("/etc", configFilename),
+	}
+	var configFile io.ReadCloser
+	var err error
+	for i, path := range paths {
+		configFile, err = os.Open(path)
+		if err != nil {
+			if i == len(paths) {
+				// exhausted all options
+				return errors.New("config file not found")
+			}
+		} else {
+			// opened file successfully
+			break
+		}
+	}
+	defer configFile.Close()
+	return json.NewDecoder(configFile).Decode(&cfg)
+}
+
+// Parse flags
+func parseFlags() {
+	flag.BoolVar(&cfg.Page, "page", cfg.Page,
 		"Generate a standalone HTML page (implies -latex=false)")
-	flag.BoolVar(&toc, "toc", false,
+	flag.BoolVar(&cfg.TOC, "toc", cfg.TOC,
 		"Generate a table of contents (implies -latex=false)")
-	flag.BoolVar(&toconly, "toconly", false,
+	flag.BoolVar(&cfg.TOCOnly, "toconly", cfg.TOCOnly,
 		"Generate a table of contents only (implies -toc)")
-	flag.BoolVar(&xhtml, "xhtml", true,
+	flag.BoolVar(&cfg.XHTML, "xhtml", cfg.XHTML,
 		"Use XHTML-style tags in HTML output")
-	flag.BoolVar(&latex, "latex", false,
+	flag.BoolVar(&cfg.Latex, "latex", cfg.Latex,
 		"Generate LaTeX output instead of HTML")
-	flag.BoolVar(&smartypants, "smartypants", true,
+	flag.BoolVar(&cfg.Smartypants, "smartypants", cfg.Smartypants,
 		"Apply smartypants-style substitutions")
-	flag.BoolVar(&latexdashes, "latexdashes", true,
+	flag.BoolVar(&cfg.LatexDashes, "latexdashes", cfg.LatexDashes,
 		"Use LaTeX-style dash rules for smartypants")
-	flag.BoolVar(&fractions, "fractions", true,
+	flag.BoolVar(&cfg.Fractions, "fractions", cfg.Fractions,
 		"Use improved fraction rules for smartypants")
-	flag.StringVar(&css, "css", "",
+	flag.BoolVar(&cfg.Footnotes, "footnotes", cfg.Footnotes,
+		"Use Pandoc-style footnotes")
+	flag.StringVar(&cfg.Title, "title", cfg.Title,
+		"Explicit page title (implies -page)")
+	flag.StringVar(&cfg.CSS, "css", cfg.CSS,
 		"Link to a CSS stylesheet (implies -page)")
-	flag.StringVar(&cpuprofile, "cpuprofile", "",
+	flag.StringVar(&cfg.CPUProfile, "cpuprofile", cfg.CPUProfile,
 		"Write cpu profile to a file")
-	flag.IntVar(&repeat, "repeat", 1,
+	flag.IntVar(&cfg.Repeat, "repeat", cfg.Repeat,
 		"Process the input multiple times (for benchmarking)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Blackfriday Markdown Processor v"+blackfriday.VERSION+
+		fmt.Fprintf(os.Stderr, "Blackfriday Markdown Processor v"+
+			blackfriday.VERSION+
 			"\nAvailable at http://github.com/russross/blackfriday\n\n"+
 			"Copyright © 2011 Russ Ross <russ@russross.com>\n"+
 			"Distributed under the Simplified BSD License\n"+
@@ -67,24 +122,32 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+}
+
+func main() {
+	// parse config file and command-line options
+	if err := parseConfig(); err != nil {
+		log.Printf("warn: problem parsing config: %v", err)
+	}
+	parseFlags()
 
 	// enforce implied options
-	if css != "" {
-		page = true
+	if cfg.CSS != "" || cfg.Title != "" {
+		cfg.Page = true
 	}
-	if page {
-		latex = false
+	if cfg.Page {
+		cfg.Latex = false
 	}
-	if toconly {
-		toc = true
+	if cfg.TOCOnly {
+		cfg.TOC = true
 	}
-	if toc {
-		latex = false
+	if cfg.TOC {
+		cfg.Latex = false
 	}
 
 	// turn on profiling?
-	if cpuprofile != "" {
-		f, err := os.Create(cpuprofile)
+	if cfg.CPUProfile != "" {
+		f, err := os.Create(cfg.CPUProfile)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 		}
@@ -107,6 +170,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, "Error reading from", args[0], ":", err)
 			os.Exit(-1)
 		}
+		// Use filename as title if there isn't one already
+		if cfg.Title == "" {
+			cfg.Title = args[0]
+		}
 	default:
 		flag.Usage()
 		os.Exit(-1)
@@ -120,43 +187,44 @@ func main() {
 	extensions |= blackfriday.EXTENSION_AUTOLINK
 	extensions |= blackfriday.EXTENSION_STRIKETHROUGH
 	extensions |= blackfriday.EXTENSION_SPACE_HEADERS
+	if cfg.Footnotes {
+		extensions |= blackfriday.EXTENSION_FOOTNOTES
+	}
 
 	var renderer blackfriday.Renderer
-	if latex {
+	if cfg.Latex {
 		// render the data into LaTeX
 		renderer = blackfriday.LatexRenderer(0)
 	} else {
 		// render the data into HTML
 		htmlFlags := 0
-		if xhtml {
+		if cfg.XHTML {
 			htmlFlags |= blackfriday.HTML_USE_XHTML
 		}
-		if smartypants {
+		if cfg.Smartypants {
 			htmlFlags |= blackfriday.HTML_USE_SMARTYPANTS
 		}
-		if fractions {
+		if cfg.Fractions {
 			htmlFlags |= blackfriday.HTML_SMARTYPANTS_FRACTIONS
 		}
-		if latexdashes {
+		if cfg.LatexDashes {
 			htmlFlags |= blackfriday.HTML_SMARTYPANTS_LATEX_DASHES
 		}
-		title := ""
-		if page {
+		if cfg.Page {
 			htmlFlags |= blackfriday.HTML_COMPLETE_PAGE
-			title = getTitle(input)
 		}
-		if toconly {
+		if cfg.TOCOnly {
 			htmlFlags |= blackfriday.HTML_OMIT_CONTENTS
 		}
-		if toc {
+		if cfg.TOC {
 			htmlFlags |= blackfriday.HTML_TOC
 		}
-		renderer = blackfriday.HtmlRenderer(htmlFlags, title, css)
+		renderer = blackfriday.HtmlRenderer(htmlFlags, cfg.Title, cfg.CSS)
 	}
 
 	// parse and render
 	var output []byte
-	for i := 0; i < repeat; i++ {
+	for i := 0; i < cfg.Repeat; i++ {
 		output = blackfriday.Markdown(input, renderer, extensions)
 	}
 
@@ -176,53 +244,4 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Error writing output:", err)
 		os.Exit(-1)
 	}
-}
-
-// try to guess the title from the input buffer
-// just check if it starts with an <h1> element and use that
-func getTitle(input []byte) string {
-	i := 0
-
-	// skip blank lines
-	for i < len(input) && (input[i] == '\n' || input[i] == '\r') {
-		i++
-	}
-	if i >= len(input) {
-		return DEFAULT_TITLE
-	}
-	if input[i] == '\r' && i+1 < len(input) && input[i+1] == '\n' {
-		i++
-	}
-
-	// find the first line
-	start := i
-	for i < len(input) && input[i] != '\n' && input[i] != '\r' {
-		i++
-	}
-	line1 := input[start:i]
-	if input[i] == '\r' && i+1 < len(input) && input[i+1] == '\n' {
-		i++
-	}
-	i++
-
-	// check for a prefix header
-	if len(line1) >= 3 && line1[0] == '#' && (line1[1] == ' ' || line1[1] == '\t') {
-		return strings.TrimSpace(string(line1[2:]))
-	}
-
-	// check for an underlined header
-	if i >= len(input) || input[i] != '=' {
-		return DEFAULT_TITLE
-	}
-	for i < len(input) && input[i] == '=' {
-		i++
-	}
-	for i < len(input) && (input[i] == ' ' || input[i] == '\t') {
-		i++
-	}
-	if i >= len(input) || (input[i] != '\n' && input[i] != '\r') {
-		return DEFAULT_TITLE
-	}
-
-	return strings.TrimSpace(string(line1))
 }
